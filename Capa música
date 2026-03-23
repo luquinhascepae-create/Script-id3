@@ -1,0 +1,79 @@
+#!/bin/bash
+
+# 1. Captura o arquivo de áudio selecionado no Nemo
+RAW_PATH=$(echo "$NEMO_SCRIPT_SELECTED_FILE_PATHS" | head -n 1)
+# Limpeza do caminho para evitar erros com espaços ou caracteres especiais
+SELECTED_AUDIO=$(python3 -c "import sys, urllib.parse; p='$RAW_PATH'.replace('file://', ''); print(urllib.parse.unquote(p).strip())")
+
+if [ ! -f "$SELECTED_AUDIO" ]; then
+    exit 1
+fi
+
+# 2. Tenta ler metadados existentes para preencher os campos automaticamente
+ORIG_TITLE=$(ffprobe -v error -show_entries format_tags=title -of default=noprint_wrappers=1:nokey=1 "$SELECTED_AUDIO" 2>/dev/null)
+ORIG_ARTIST=$(ffprobe -v error -show_entries format_tags=artist -of default=noprint_wrappers=1:nokey=1 "$SELECTED_AUDIO" 2>/dev/null)
+
+# 3. Interface Principal (YAD) - Campos de Texto + URL
+# Usamos o separador "|" para garantir que o script leia cada campo corretamente
+INTERFACE=$(yad --title="Editor de Metadados Profissional" --form --width=500 --separator="|" \
+    --text="Arquivo: $(basename "$SELECTED_AUDIO")\nPreencha os dados e use a URL da imagem para a capa." \
+    --field="Nome da Faixa (Título):" "$ORIG_TITLE" \
+    --field="Autor (Artista):" "$ORIG_ARTIST" \
+    --field="URL da Imagem de Capa:" "" \
+    --button="PESQUISAR NO GOOGLE:2" \
+    --button="SALVAR ALTERAÇÕES:0" \
+    --button="CANCELAR:1")
+
+RET=$?
+
+# 4. Lógica do Botão Pesquisar (Botão 2)
+if [ $RET -eq 2 ]; then
+    # Usa o nome do arquivo para facilitar a busca de arte de álbum
+    BUSCA=$(basename "$SELECTED_AUDIO" | sed 's/\.[^.]*$//')
+    xdg-open "https://www.google.com/search?q=${BUSCA}+album+art&tbm=isch"
+    # Reinicia o script para que a janela reapareça após a busca
+    exec "$0"
+fi
+
+# Se o usuário cancelar ou fechar a janela
+[ $RET -ne 0 ] && exit 0
+
+# 5. Extração dos novos valores
+NOVO_TITULO=$(echo "$INTERFACE" | cut -d'|' -f1)
+NOVO_ARTISTA=$(echo "$INTERFACE" | cut -d'|' -f2)
+IMG_URL=$(echo "$INTERFACE" | cut -d'|' -f3)
+
+TEMP_IMG="/tmp/capa_temp_$(date +%s).jpg"
+TEMP_AUDIO="/tmp/audio_final_$(date +%s).mp3"
+
+# 6. Aplicação das Mudanças
+if [ -n "$IMG_URL" ]; then
+    notify-send "Processando" "Baixando capa e injetando metadados..."
+    # Baixa e redimensiona a imagem para um padrão quadrado de alta qualidade
+    curl -s -L "$IMG_URL" -o "$TEMP_IMG"
+    convert "$TEMP_IMG" -resize 600x600^ -gravity center -extent 600x600 "$TEMP_IMG"
+    
+    # Injeta Áudio + Imagem + Título + Artista
+    ffmpeg -i "$SELECTED_AUDIO" -i "$TEMP_IMG" \
+    -map 0:a -map 1:0 -c copy \
+    -metadata title="$NOVO_TITULO" \
+    -metadata artist="$NOVO_ARTISTA" \
+    -disposition:v:0 attached_pic -y "$TEMP_AUDIO"
+else
+    # Atualiza apenas os textos (Título e Artista)
+    notify-send "Processando" "Atualizando informações de texto..."
+    ffmpeg -i "$SELECTED_AUDIO" -c copy \
+    -metadata title="$NOVO_TITULO" \
+    -metadata artist="$NOVO_ARTISTA" -y "$TEMP_AUDIO"
+fi
+
+# 7. Finalização e Substituição do Arquivo
+if [ $? -eq 0 ]; then
+    mv "$TEMP_AUDIO" "$SELECTED_AUDIO"
+    notify-send "Sucesso!" "Música: $NOVO_TITULO\nArtista: $NOVO_ARTISTA" --icon="audio-x-generic"
+else
+    notify-send "Erro" "Falha ao gravar os metadados no arquivo."
+fi
+
+# Limpeza de arquivos temporários
+rm -f "$TEMP_IMG" "$TEMP_AUDIO"
